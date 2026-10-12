@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import xml.etree.ElementTree as ET
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1219,6 +1221,87 @@ class TestStartScanConcurrentLimit:
             assert result["status"] == "started"
         finally:
             set_policy(original)
+
+
+class TestScanStartLockSerialisation:
+    """_scan_start_lock must serialise the concurrency probe and the start.
+
+    gvmd only reports the first scan as Running once its start completes, so
+    without the lock a second launch would probe in that window, see a free slot
+    and start too.
+    """
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            ("start_scan", "start_scan"),
+            ("start_task", "start_task"),
+            ("start_scan", "start_task"),
+        ],
+    )
+    async def test_second_launch_waits_and_sees_first(
+        self, gmp_session_mock, monkeypatch, first, second
+    ):
+        from openvas_mcp import server
+
+        # An asyncio.Lock binds to the first event loop it waits on, and each test
+        # runs in its own loop; the tools read the module global at call time.
+        monkeypatch.setattr(server, "_scan_start_lock", asyncio.Lock())
+        entered = threading.Event()
+        release = threading.Event()
+        start_calls: list[str] = []
+        running: list[str] = []
+
+        def _get_tasks(filter_string: str = "") -> ET.Element:
+            rows = "".join(f'<task id="{t}"><status>Running</status></task>' for t in running)
+            return ET.fromstring(f"<get_tasks_response>{rows}</get_tasks_response>")
+
+        def _start(task_id: str) -> ET.Element:
+            start_calls.append(task_id)
+            if len(start_calls) == 1:
+                entered.set()
+                release.wait(timeout=5)
+            running.append(task_id)
+            return _start_task_xml()
+
+        gmp_session_mock.get_tasks.side_effect = _get_tasks
+        gmp_session_mock.get_task.return_value = _task_xml(status="Done")
+        gmp_session_mock.create_task.return_value = ET.fromstring(
+            f'<create_task_response id="{_VALID_UUID}"/>'
+        )
+        gmp_session_mock.start_task.side_effect = _start
+        launch = {
+            "start_scan": lambda: start_scan(name="scan", target_id=_VALID_UUID),
+            "start_task": lambda: start_task(task_id=_VALID_UUID),
+        }
+
+        original = get_policy()
+        set_policy(
+            Policy(
+                default_policy=ClientPolicy(
+                    allowed_tools=["*"],
+                    allowed_cidrs=["*"],
+                    max_concurrent_scans=1,
+                )
+            )
+        )
+        try:
+            a = asyncio.create_task(launch[first]())
+            assert await asyncio.to_thread(entered.wait, 5)
+            b = asyncio.create_task(launch[second]())
+            # Give the second launch ample time to probe, were it not blocked.
+            await asyncio.sleep(0.2)
+            assert gmp_session_mock.get_tasks.call_count == 1
+            release.set()
+            result_a, result_b = await asyncio.gather(a, b)
+        finally:
+            release.set()
+            set_policy(original)
+
+        assert result_a["status"] == "started"
+        assert result_b["error"] is True
+        assert result_b["code"] == "rate_limited"
+        assert len(start_calls) == 1
 
 
 class TestStartTaskConcurrentLimit:

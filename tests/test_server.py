@@ -24,6 +24,7 @@ from openvas_mcp.server import (
 
 _VALID_UUID = "12345678-1234-1234-1234-123456789abc"
 _VALID_UUID2 = "abcdef12-abcd-abcd-abcd-abcdef123456"
+_VALID_UUID3 = "0f0f0f0f-0f0f-0f0f-0f0f-0f0f0f0f0f0f"
 
 
 # ---------------------------------------------------------------------------
@@ -387,14 +388,71 @@ class TestListTasks:
 
     async def test_target_paging_stops_when_gvmd_restarts_at_first_page(self, gmp_session_mock):
         """gvmd answers a first= past the end with page one again, never an empty page."""
-        gmp_session_mock.get_tasks.return_value = _task_xml()
+        # The task's target is never found, so only the restart check ends the loop.
+        gmp_session_mock.get_tasks.return_value = _task_xml(target_id=_VALID_UUID3)
         gmp_session_mock.get_targets.side_effect = [
             _targets_page_xml([(_VALID_UUID, "1")], start=1, filtered=3),
             _targets_page_xml([(_VALID_UUID, "1")], start=1, filtered=3),
         ]
         row = (await list_tasks())[0]
-        assert row["host_count"] == 1
+        assert row["host_count"] is None
         assert gmp_session_mock.get_targets.call_count == 2
+
+    async def test_target_paging_stops_once_referenced_targets_are_seen(self, gmp_session_mock):
+        gmp_session_mock.get_tasks.return_value = _task_xml(target_id=_VALID_UUID)
+        gmp_session_mock.get_targets.side_effect = [
+            _targets_page_xml([(_VALID_UUID, "1")], start=1, filtered=2),
+            _targets_page_xml([(_VALID_UUID2, "254")], start=2, filtered=2),
+        ]
+        row = (await list_tasks())[0]
+        assert row["host_count"] == 1
+        assert gmp_session_mock.get_targets.call_count == 1
+
+    async def test_target_paging_capped_degrades_to_null(
+        self, gmp_session_mock, monkeypatch, caplog
+    ):
+        """Past GVM_TARGET_MAX_PAGES the remaining tasks get host_count null."""
+        from openvas_mcp import server
+
+        monkeypatch.setattr(server.cfg, "target_max_pages", 2)
+        gmp_session_mock.get_tasks.return_value = _task_xml(target_id=_VALID_UUID3)
+        gmp_session_mock.get_targets.side_effect = [
+            _targets_page_xml([(_VALID_UUID, "1")], start=1, filtered=3),
+            _targets_page_xml([(_VALID_UUID2, "2")], start=2, filtered=3),
+            _targets_page_xml([(_VALID_UUID3, "3")], start=3, filtered=3),
+        ]
+        with caplog.at_level("WARNING", logger="openvas_mcp.server"):
+            rows = await list_tasks()
+        assert isinstance(rows, list)
+        assert rows[0]["host_count"] is None
+        assert gmp_session_mock.get_targets.call_count == 2
+        assert any(r.getMessage() == "target paging capped" for r in caplog.records)
+
+    async def test_zero_target_page_cap_is_unlimited(self, gmp_session_mock, monkeypatch):
+        from openvas_mcp import server
+
+        monkeypatch.setattr(server.cfg, "target_max_pages", 0)
+        gmp_session_mock.get_tasks.return_value = _task_xml(target_id=_VALID_UUID3)
+        gmp_session_mock.get_targets.side_effect = [
+            _targets_page_xml([(_VALID_UUID, "1")], start=1, filtered=3),
+            _targets_page_xml([(_VALID_UUID2, "2")], start=2, filtered=3),
+            _targets_page_xml([(_VALID_UUID3, "3")], start=3, filtered=3),
+        ]
+        row = (await list_tasks())[0]
+        assert row["host_count"] == 3
+        assert gmp_session_mock.get_targets.call_count == 3
+
+    async def test_no_tasks_fetches_no_targets(self, gmp_session_mock):
+        gmp_session_mock.get_tasks.return_value = ET.fromstring("<get_tasks_response/>")
+        assert await list_tasks() == []
+        gmp_session_mock.get_targets.assert_not_called()
+
+    async def test_task_without_target_fetches_no_targets(self, gmp_session_mock):
+        """A container task names no target, so there is nothing to resolve."""
+        gmp_session_mock.get_tasks.return_value = _task_xml(target_id="")
+        row = (await list_tasks())[0]
+        assert row["host_count"] is None
+        gmp_session_mock.get_targets.assert_not_called()
 
     async def test_unreadable_targets_degrade_to_null_host_count(self, gmp_session_mock):
         """An account that can read tasks but not targets keeps list_tasks."""
